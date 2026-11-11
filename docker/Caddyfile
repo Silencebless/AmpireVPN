@@ -1,0 +1,16 @@
+# Автоматический HTTPS (Let's Encrypt) для домена бота.
+# Нужен только если на сервере НЕТ другого реверс-прокси на портах 80/443.
+{$BOT_DOMAIN} {
+	encode zstd gzip
+
+	# Служебные эндпоинты не публикуем в интернет: /readyz ходит в БД и Redis, /metrics — внутренний.
+	# Prometheus и docker-healthcheck обращаются к контейнеру напрямую, минуя этот прокси.
+	@internal path /healthz /readyz /metrics /metrics/*
+	handle @internal {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy bot:8080
+	}
+}

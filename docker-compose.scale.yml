@@ -1,0 +1,123 @@
+# AmpireVPN — режим для большой нагрузки: несколько реплик api + отдельный worker + балансировщик Caddy.
+#
+#   docker compose -f docker-compose.scale.yml up -d --build        — первый запуск
+#   ./deploy/scripts/rolling-update.sh                               — обновление БЕЗ простоя (по одной реплике)
+#
+# Требования: TELEGRAM_MODE=webhook (задан ниже), PUBLIC_BASE_URL с https и доменом, указывающим на этот сервер.
+# Подробности и рекомендации по размерам — docs/SCALING.md, эксплуатация — docs/OPERATIONS.md
+#
+# Миграции БД применяются при старте первой же реплики (advisory-lock), поэтому они обязаны быть обратно
+# совместимыми со старым кодом (только добавление колонок/таблиц) — иначе раскатка по одной реплике невозможна.
+
+x-bot: &bot
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  env_file: .env
+  restart: unless-stopped
+  stop_grace_period: 45s
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks: [ampire]
+
+x-env: &env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ampire}:${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}@postgres:5432/${POSTGRES_DB:-ampire}
+  MIGRATION_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ampire}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ampire}
+  REDIS_URL: redis://redis:6379/0
+  WEB_HOST: 0.0.0.0
+  WEB_PORT: "8080"
+  DB_POOL_SIZE: "8"
+  DB_MAX_OVERFLOW: "8"
+
+services:
+  api:
+    <<: *bot
+    environment:
+      <<: *env
+      APP_ROLE: api
+      TELEGRAM_MODE: webhook
+    deploy:
+      replicas: 2
+    expose: ["8080"]
+
+  worker:
+    <<: *bot
+    container_name: ampire-worker
+    environment:
+      <<: *env
+      APP_ROLE: worker
+    expose: ["8080"]    # /metrics воркера: job_seconds, job_errors_total, panel_* — его нужно скрейпить (deploy/prometheus)
+
+  postgres:
+    image: postgres:15-bookworm
+    container_name: ampire-postgres
+    restart: unless-stopped
+    stop_grace_period: 60s
+    command:
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - log_min_duration_statement=500
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ampire}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}
+      POSTGRES_DB: ${POSTGRES_DB:-ampire}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ampire} -d ${POSTGRES_DB:-ampire}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [ampire]
+
+  redis:
+    image: redis:7-alpine
+    container_name: ampire-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [ampire]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: ampire-caddy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      BOT_DOMAIN: ${BOT_DOMAIN:?задайте BOT_DOMAIN в .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/Caddyfile.scale:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api]
+    networks: [ampire]
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  ampire:

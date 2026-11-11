@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    name: Проверки и тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Зависимости
+        run: |
+          if [ -f requirements.lock ]; then pip install --require-hashes -r requirements.lock; else pip install -r requirements.txt; fi
+      - name: Компиляция
+        run: python -m compileall -q app scripts
+      - name: Статическая проверка (кнопки ↔ обработчики, тексты, настройки)
+        run: python scripts/check_code.py
+      - name: Юнит-тесты (платежи, цены, автопродление, рассылки, безопасность, миграции…)
+        run: python -m unittest discover -s tests -v
+
+  integration:
+    name: Интеграция с PostgreSQL и Redis
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ampire
+          POSTGRES_PASSWORD: ci-password
+          POSTGRES_DB: ampire
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ampire" --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://ampire:ci-password@localhost:5432/ampire
+      REDIS_URL: redis://localhost:6379/0
+      BOT_TOKEN: "123456:CI"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          if [ -f requirements.lock ]; then pip install --require-hashes -r requirements.lock; else pip install -r requirements.txt; fi
+      - name: Миграции с нуля и SQL автопродления на настоящей БД
+        run: python scripts/ci_smoke.py
+
+  docker:
+    name: Сборка образа и проверка compose-файлов
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: ci-password
+      BOT_DOMAIN: bot.example.com
+      BACKUP_S3_ENDPOINT: s3.example.com
+      BACKUP_S3_BUCKET: ci
+      BACKUP_S3_KEY: ci
+      BACKUP_S3_SECRET: ci
+      BACKUP_REPO_PASSPHRASE: ci
+      METRICS_TOKEN: ci
+      ALERT_CHAT_ID: "1"
+      BOT_TOKEN: "1:ci"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Образ приложения
+        run: docker build -f docker/Dockerfile -t ampirevpn-bot:ci .
+      - name: Образ PostgreSQL с pgBackRest
+        run: docker build -f deploy/backup/Dockerfile -t ampirevpn-postgres:ci .
+      - name: Синтаксис compose
+        run: |
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.scale.yml config -q
+          docker compose -f docker-compose.yml -f docker-compose.backup.yml config -q
+          docker compose -f docker-compose.scale.yml -f docker-compose.backup.yml -f docker-compose.monitoring.yml config -q
+      - name: Конфиг Caddy
+        run: |
+          docker run --rm -e BOT_DOMAIN=bot.example.com -v "$PWD/docker/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
+          docker run --rm -e BOT_DOMAIN=bot.example.com -v "$PWD/docker/Caddyfile.scale:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
+      - name: Конфиг Prometheus
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/p:ro" prom/prometheus:v2.55.1 check config /p/prometheus.yml || true
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/p:ro" prom/prometheus:v2.55.1 check rules /p/alerts.yml
+      - name: Shell-скрипты
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning deploy/backup/*.sh deploy/scripts/*.sh scripts/*.sh

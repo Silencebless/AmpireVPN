@@ -1,0 +1,100 @@
+# AmpireVPN — бот + PostgreSQL + Redis (+ опциональный Caddy для HTTPS)
+#
+#   docker compose up -d --build                    — без Caddy (свой реверс-прокси)
+#   docker compose --profile caddy up -d --build    — с Caddy (автоматический HTTPS)
+#
+# Резервные копии (PITR) — docker-compose.backup.yml, мониторинг — docker-compose.monitoring.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.backup.yml up -d --build
+#
+# Для большой нагрузки (несколько реплик + отдельный воркер) см. docker-compose.scale.yml и docs/SCALING.md
+#
+# Имена БД/пользователя по умолчанию — ampire. Если у вас уже есть том с данными от прежней версии
+# (пользователь celeste), задайте в .env: POSTGRES_USER=celeste и POSTGRES_DB=celeste.
+
+x-db: &db
+  POSTGRES_USER: ${POSTGRES_USER:-ampire}
+  POSTGRES_DB: ${POSTGRES_DB:-ampire}
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: ampire-bot
+    restart: unless-stopped
+    # даём время дозавершить обработку платежей/рассылку/задачи воркера при остановке (SIGTERM → корректное завершение)
+    stop_grace_period: 45s
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ampire}:${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}@postgres:5432/${POSTGRES_DB:-ampire}
+      REDIS_URL: redis://redis:6379/0
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"   # наружу не торчит: ходим через реверс-прокси / Caddy
+    networks: [ampire]
+
+  postgres:
+    image: postgres:15-bookworm
+    container_name: ampire-postgres
+    restart: unless-stopped
+    stop_grace_period: 60s
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+    environment:
+      <<: *db
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ampire} -d ${POSTGRES_DB:-ampire}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [ampire]
+
+  redis:
+    image: redis:7-alpine
+    container_name: ampire-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [ampire]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: ampire-caddy
+    profiles: ["caddy"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      BOT_DOMAIN: ${BOT_DOMAIN:?задайте BOT_DOMAIN в .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [bot]
+    networks: [ampire]
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  ampire:

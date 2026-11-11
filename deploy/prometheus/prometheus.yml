@@ -1,0 +1,42 @@
+# Prometheus для AmpireVPN. Скрейпим ОБА типа процессов:
+#   api    — реплики приёма запросов: tg_updates_total, web_requests_total, handler_errors_total, payments_total (вебхуки);
+#   worker — фоновые задачи: job_seconds, job_errors_total, job_last_success_timestamp, payments_total (сверка, автосписание),
+#            panel_*, outbox_size, redis_up, payments_needs_review.
+# Раньше собирался только api — падение задачи воркера оставалось невидимым.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/metrics_token       # METRICS_TOKEN из .env (создаётся при старте контейнера)
+    dns_sd_configs:                               # все реплики api (Docker DNS отдаёт адрес каждой)
+      - names: ["api"]
+        type: A
+        port: 8080
+        refresh_interval: 10s
+
+  - job_name: worker                              # ← отдельный job: метрики воркера живут только в его процессе
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/metrics_token
+    static_configs:
+      - targets: ["worker:8080"]
+
+  # для одиночной установки (docker-compose.yml, роль all) — раскомментируйте вместо api/worker:
+  # - job_name: bot
+  #   metrics_path: /metrics
+  #   authorization: { type: Bearer, credentials_file: /tmp/metrics_token }
+  #   static_configs: [{ targets: ["bot:8080"] }]

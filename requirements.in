@@ -1,0 +1,13 @@
+# Прямые зависимости с границами совместимости. Точные версии с хэшами — в requirements.lock (scripts/lock.sh).
+aiogram[redis]>=3.20,<3.30
+aiohttp>=3.9,<4
+SQLAlchemy[asyncio]>=2.0.30,<2.1
+asyncpg>=0.29,<0.32
+alembic>=1.13,<1.18
+httpx>=0.27,<0.29
+pydantic>=2.6,<3
+pydantic-settings>=2.2,<3
+cryptography>=42,<48
+matplotlib>=3.8,<3.11
+sentry-sdk>=2.0,<3
+tzdata

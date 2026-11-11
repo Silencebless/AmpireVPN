@@ -1,0 +1,77 @@
+# Непрерывный архив WAL (PITR) + ежедневные копии pgBackRest + копия вне сервера (S3) + ежемесячный тест восстановления.
+#
+#   docker compose -f docker-compose.yml        -f docker-compose.backup.yml up -d --build     # один сервер
+#   docker compose -f docker-compose.scale.yml  -f docker-compose.backup.yml up -d --build     # режим масштабирования
+#
+# Что получаем: RPO — около минуты (а не «сутки», как у ежедневного дампа в Telegram): после аварии база восстанавливается
+# на любой момент времени, и оплаты за последний день не пропадают. Копии лежат в S3-совместимом хранилище на ДРУГОЙ площадке
+# и шифруются на стороне сервера паролем BACKUP_REPO_PASSPHRASE (храните его отдельно!).
+# Настройка и восстановление — docs/BACKUP.md. Переменные — блок «Резервные копии» в .env.example.
+
+x-pgbackrest-env: &pgbr
+  PGBACKREST_STANZA: ampire
+  PGBACKREST_REPO1_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:?задайте BACKUP_S3_ENDPOINT в .env}
+  PGBACKREST_REPO1_S3_BUCKET: ${BACKUP_S3_BUCKET:?задайте BACKUP_S3_BUCKET в .env}
+  PGBACKREST_REPO1_S3_REGION: ${BACKUP_S3_REGION:-ru-central1}
+  PGBACKREST_REPO1_S3_KEY: ${BACKUP_S3_KEY:?задайте BACKUP_S3_KEY в .env}
+  PGBACKREST_REPO1_S3_KEY_SECRET: ${BACKUP_S3_SECRET:?задайте BACKUP_S3_SECRET в .env}
+  PGBACKREST_REPO1_S3_URI_STYLE: ${BACKUP_S3_URI_STYLE:-host}   # для MinIO и некоторых провайдеров — path
+  PGBACKREST_REPO1_CIPHER_PASS: ${BACKUP_REPO_PASSPHRASE:?задайте BACKUP_REPO_PASSPHRASE в .env}
+
+x-pg-image: &pgimage
+  build:
+    context: .
+    dockerfile: deploy/backup/Dockerfile
+  image: ampirevpn-postgres:15
+
+services:
+  postgres:
+    <<: *pgimage
+    command:
+      - postgres
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-300}
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=pgbackrest --stanza=ampire archive-push %p
+      - -c
+      - archive_timeout=60
+    environment:
+      <<: *pgbr
+    volumes:
+      - pgsocket:/var/run/postgresql
+      - pgbackrest_spool:/var/spool/pgbackrest
+
+  pgbackrest:
+    <<: *pgimage
+    container_name: ampire-pgbackrest
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["/usr/local/bin/backup-loop.sh"]
+    environment:
+      <<: *pgbr
+      POSTGRES_USER: ${POSTGRES_USER:-ampire}
+      POSTGRES_DB: ${POSTGRES_DB:-ampire}
+      REDIS_HOST: redis
+      BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-1}
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      OWNER_IDS: ${OWNER_IDS:-}
+    volumes:
+      - pgdata:/var/lib/postgresql/data:ro
+      - pgsocket:/var/run/postgresql
+      - pgbackrest_spool:/var/spool/pgbackrest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [ampire]
+
+volumes:
+  pgsocket:
+  pgbackrest_spool:

@@ -1,0 +1,50 @@
+# Балансировщик для режима масштабирования: запросы распределяются по всем репликам сервиса api.
+# Docker DNS отдаёт адреса всех контейнеров api, Caddy обновляет список каждые 5 секунд.
+#
+# Проверки здоровья. Активные health-check (health_uri) Caddy выполняет по статическому списку upstream'ов, а для
+# динамических (dynamic a) на них полагаться нельзя — поэтому здесь ПАССИВНЫЕ проверки + повтор запроса на другой
+# реплике (lb_try_*): упавшую реплику Caddy перестаёт выбирать после нескольких ошибок, а клиент ошибки не видит.
+# Поведение обязательно проверьте на стенде (docs/OPERATIONS.md → «Проверка балансировщика»).
+{$BOT_DOMAIN} {
+	encode zstd gzip
+
+	# Служебные эндпоинты наружу не отдаём (каждый вызов /readyz — запрос в БД и Redis; /metrics — внутренний).
+	@internal path /healthz /readyz /metrics /metrics/*
+	handle @internal {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy {
+			dynamic a {
+				name api
+				port 8080
+				refresh 5s
+			}
+			lb_policy least_conn
+
+			# если реплика не ответила — пробуем другую до 5 секунд (деплой и перезапуски проходят незаметно)
+			lb_try_duration 5s
+			lb_try_interval 250ms
+
+			# пассивные проверки: 3 сбоя за 30 секунд — реплика на 30 секунд выводится из выбора
+			fail_duration 30s
+			max_fails 3
+			unhealthy_status 5xx
+			unhealthy_latency 10s
+
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 30s
+			}
+		}
+	}
+}
+
+# Вариант со статическим списком (если число реплик фиксировано) — там работают и активные проверки:
+#   reverse_proxy api-1:8080 api-2:8080 {
+#       health_uri /readyz
+#       health_interval 5s
+#       health_timeout 3s
+#       lb_try_duration 5s
+#   }

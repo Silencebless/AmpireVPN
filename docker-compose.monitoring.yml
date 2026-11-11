@@ -1,0 +1,54 @@
+# Мониторинг: Prometheus (собирает api И worker) + Alertmanager (алерты в Telegram).
+#
+#   docker compose -f docker-compose.scale.yml -f docker-compose.monitoring.yml up -d
+#
+# В .env: METRICS_TOKEN (обязателен — без него /metrics выключен), ALERT_BOT_TOKEN (можно тот же BOT_TOKEN),
+# ALERT_CHAT_ID (ваш Telegram ID или ID чата). Порты наружу НЕ публикуются — смотрите через ssh-туннель:
+#   ssh -L 9090:localhost:9090 сервер
+# Для одиночной установки (роль all) отредактируйте deploy/prometheus/prometheus.yml (блок job «bot»).
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: ampire-prometheus
+    restart: unless-stopped
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:?задайте METRICS_TOKEN в .env}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        printf '%s' "$$METRICS_TOKEN" > /tmp/metrics_token
+        exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=30d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [ampire]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: ampire-alertmanager
+    restart: unless-stopped
+    environment:
+      ALERT_BOT_TOKEN: ${ALERT_BOT_TOKEN:-${BOT_TOKEN}}
+      ALERT_CHAT_ID: ${ALERT_CHAT_ID:?задайте ALERT_CHAT_ID в .env}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sed -e "s|__BOT_TOKEN__|$$ALERT_BOT_TOKEN|" -e "s|__CHAT_ID__|$$ALERT_CHAT_ID|" /etc/alertmanager/alertmanager.tmpl > /tmp/alertmanager.yml
+        exec /bin/alertmanager --config.file=/tmp/alertmanager.yml --storage.path=/alertmanager
+    volumes:
+      - ./deploy/prometheus/alertmanager.tmpl:/etc/alertmanager/alertmanager.tmpl:ro
+      - amdata:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks: [ampire]
+
+volumes:
+  promdata:
+  amdata:
